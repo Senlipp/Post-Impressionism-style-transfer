@@ -5,35 +5,66 @@ from torchvision import models
 import numpy as np
 
 
-# Generator with encoder-decoder architecture and skip connections
 class Generator(nn.Module):
     def __init__(self):
         super(Generator, self).__init__()
         
-        # Encoder layers
-        self.enc_conv1 = nn.Conv2d(3, 64, kernel_size=4, stride=2, padding=1)  # (64, H/2, W/2)
+        # Encoder layers (unchanged)
+        self.enc_conv1 = nn.Conv2d(3, 64, kernel_size=4, stride=2, padding=1)    # (64, H/2, W/2)
         self.enc_conv2 = nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1)  # (128, H/4, W/4)
-        self.enc_conv3 = nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1)  # (256, H/8, W/8)
-        self.enc_conv4 = nn.Conv2d(256, 512, kernel_size=4, stride=2, padding=1)  # (512, H/16, W/16)
+        self.enc_conv3 = nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1) # (256, H/8, W/8)
+        self.enc_conv4 = nn.Conv2d(256, 512, kernel_size=4, stride=2, padding=1) # (512, H/16, W/16)
         
         # Bottleneck layer
-        self.bottleneck = nn.Conv2d(512, 512, kernel_size=4, stride=2, padding=1)  # (512, H/32, W/32)
+        self.bottleneck = nn.Conv2d(512, 512, kernel_size=4, stride=2, padding=1) # (512, H/32, W/32)
         
-        # Decoder layers
-        self.dec_conv4 = nn.ConvTranspose2d(512, 512, kernel_size=4, stride=2, padding=1)  # (512, H/16, W/16)
-        self.dec_conv3 = nn.ConvTranspose2d(1024, 256, kernel_size=4, stride=2, padding=1)  # (256, H/8, W/8)
-        self.dec_conv2 = nn.ConvTranspose2d(512, 128, kernel_size=4, stride=2, padding=1)  # (128, H/4, W/4)
-        self.dec_conv1 = nn.ConvTranspose2d(256, 64, kernel_size=4, stride=2, padding=1)  # (64, H/2, W/2)
+        # Decoder
+        # Use reflection padding before each conv to avoid hard edges
+        # Remove padding=1 from convs since reflection pad handles that.
         
-        # Output layer
-        self.final_conv = nn.ConvTranspose2d(128, 3, kernel_size=4, stride=2, padding=1)  # (3, H, W)
+        # Decoder stage corresponding to enc_conv4
+        self.dec_up4 = nn.Upsample(scale_factor=2, mode='bicubic')
+        self.dec_pad4 = nn.ReflectionPad2d(1)
+        self.dec_conv4 = nn.Conv2d(512, 512, kernel_size=3, padding=0)
+        self.dec_norm4 = nn.InstanceNorm2d(512, affine=True)
+        
+        # Decoder stage corresponding to enc_conv3
+        self.dec_up3 = nn.Upsample(scale_factor=2, mode='bicubic')
+        self.dec_pad3 = nn.ReflectionPad2d(1)
+        self.dec_conv3 = nn.Conv2d(512, 256, kernel_size=3, padding=0)
+        self.dec_norm3 = nn.InstanceNorm2d(256, affine=True)
+        
+        # Decoder stage corresponding to enc_conv2
+        self.dec_up2 = nn.Upsample(scale_factor=2, mode='bicubic')
+        self.dec_pad2 = nn.ReflectionPad2d(1)
+        self.dec_conv2 = nn.Conv2d(256, 128, kernel_size=3, padding=0)
+        self.dec_norm2 = nn.InstanceNorm2d(128, affine=True)
+        
+        # Decoder stage corresponding to enc_conv1
+        self.dec_up1 = nn.Upsample(scale_factor=2, mode='bicubic')
+        self.dec_pad1 = nn.ReflectionPad2d(1)
+        self.dec_conv1 = nn.Conv2d(128, 64, kernel_size=3, padding=0)
+        self.dec_norm1 = nn.InstanceNorm2d(64, affine=True)
+        
+        # Final output layer
+        self.final_up = nn.Upsample(scale_factor=2, mode='bicubic')
+        self.final_pad = nn.ReflectionPad2d(1)
+        self.final_conv = nn.Conv2d(64, 3, kernel_size=3, padding=0)
         
         # Activation functions
         self.relu = nn.ReLU(inplace=True)
         
+        # Learnable weights for skip connections
+        self.alpha1 = nn.Parameter(torch.tensor(0.5))
+        self.alpha2 = nn.Parameter(torch.tensor(0.5))
+        self.alpha3 = nn.Parameter(torch.tensor(0.5))
+        self.alpha4 = nn.Parameter(torch.tensor(0.5))
+        
     def forward(self, x):
-        # Encoder
-        e1 = self.relu(self.enc_conv1(x))  # (64, H/2, W/2)
+        # -----------------
+        #      Encoder
+        # -----------------
+        e1 = self.relu(self.enc_conv1(x))   # (64, H/2, W/2)
         e2 = self.relu(self.enc_conv2(e1))  # (128, H/4, W/4)
         e3 = self.relu(self.enc_conv3(e2))  # (256, H/8, W/8)
         e4 = self.relu(self.enc_conv4(e3))  # (512, H/16, W/16)
@@ -41,24 +72,41 @@ class Generator(nn.Module):
         # Bottleneck
         b = self.relu(self.bottleneck(e4))  # (512, H/32, W/32)
         
-        # Decoder with skip connections
-        d4 = self.relu(self.dec_conv4(b))  # (512, H/16, W/16)
-        d4 = torch.cat((d4, e4), dim=1)  # Concatenate with e4 (512 + 512 = 1024 channels)
+        # -----------------
+        #      Decoder
+        # -----------------
+        # Decode from bottleneck to match e4 size
+        d4 = self.dec_up4(b)
+        d4 = self.dec_pad4(d4)
+        d4 = self.relu(self.dec_norm4(self.dec_conv4(d4)))
+        d4 = self.alpha4 * d4 + (1 - self.alpha4) * e4
         
-        d3 = self.relu(self.dec_conv3(d4))  # (256, H/8, W/8)
-        d3 = torch.cat((d3, e3), dim=1)  # (256 + 256 = 512 channels)
+        # Decode and skip connect with e3
+        d3 = self.dec_up3(d4)
+        d3 = self.dec_pad3(d3)
+        d3 = self.relu(self.dec_norm3(self.dec_conv3(d3)))
+        d3 = self.alpha3 * d3 + (1 - self.alpha3) * e3
         
-        d2 = self.relu(self.dec_conv2(d3))  # (128, H/4, W/4)
-        d2 = torch.cat((d2, e2), dim=1)  # (128 + 128 = 256 channels)
+        # Decode and skip connect with e2
+        d2 = self.dec_up2(d3)
+        d2 = self.dec_pad2(d2)
+        d2 = self.relu(self.dec_norm2(self.dec_conv2(d2)))
+        d2 = self.alpha2 * d2 + (1 - self.alpha2) * e2
         
-        d1 = self.relu(self.dec_conv1(d2))  # (64, H/2, W/2)
-        d1 = torch.cat((d1, e1), dim=1)  # (64 + 64 = 128 channels)
+        # Decode and skip connect with e1
+        d1 = self.dec_up1(d2)
+        d1 = self.dec_pad1(d1)
+        d1 = self.relu(self.dec_norm1(self.dec_conv1(d1)))
+        d1 = self.alpha1 * d1 + (1 - self.alpha1) * e1
         
-        # Output layer
-        out = self.final_conv(d1)  # (3, H, W)
-        out = torch.tanh(out)  # Output range [-1, 1]
+        # Final upsample and output
+        out = self.final_up(d1)
+        out = self.final_pad(out)
+        out = self.final_conv(out)
+        out = torch.tanh(out)  # Range [-1, 1]
         
         return out
+
 
 # Discriminator using PatchGAN
 class Discriminator(nn.Module):
@@ -83,66 +131,47 @@ class Discriminator(nn.Module):
         x = torch.sigmoid(x)  # Probability map
         return x
 
+
 class FeatureExtractor(nn.Module):
     def __init__(self):
         super(FeatureExtractor, self).__init__()
-        resnet50 = models.resnet50(pretrained=True)
-        
-        # Extract specific layers for style and content loss
-        # Exclude 'avgpool' and 'fc' layers
-        self.shallow_layers = nn.Sequential(
-            resnet50.conv1,
-            resnet50.bn1,
-            resnet50.relu,
-            resnet50.maxpool
-        )
-        self.layer1 = resnet50.layer1  # 64
-        self.layer2 = resnet50.layer2  # 128
-        self.layer3 = resnet50.layer3  # 256
-        self.layer4 = resnet50.layer4  # 512
-        
+        vgg19 = models.vgg19(pretrained=True).features
+
+        # We select the layers of interest for style and content
+        # Layers (with indices):
+        # relu1_1: index 1
+        # relu2_1: index 6
+        # relu3_1: index 11
+        # relu4_1: index 20
+        # relu4_2: index 21 (content)
+        self.style_layers = [1, 6, 11, 20]
+        self.content_layer = 21
+
+        # Keep only layers up to relu4_2 for efficiency if desired:
+        # or just keep all and stop after reaching content_layer
+        self.vgg_layers = vgg19[:self.content_layer+1]
+
         # Freeze parameters
         for param in self.parameters():
             param.requires_grad = False
-                
+
     def forward(self, x):
-        features = []
-        
-        # Shallow features (after initial layers)
-        x = self.shallow_layers(x)
-        features.append(x)  # Features after maxpool
-        
-        # Deeper features
-        x = self.layer1(x)
-        features.append(x)
-        x = self.layer2(x)
-        features.append(x)
-        x = self.layer3(x)
-        features.append(x)
-        x = self.layer4(x)
-        features.append(x)
-        
-        return features  # List of feature maps from different layers
+        style_features = []
+        content_feature = None
+
+        for i, layer in enumerate(self.vgg_layers):
+            x = layer(x)
+            if i in self.style_layers:
+                style_features.append(x)
+            if i == self.content_layer:
+                content_feature = x
+                break
+
+        # Return style and content features
+        return style_features, content_feature
 
 
-class LossTracker:
-    def __init__(self):
-        self.content_loss_history = []
-        self.style_loss_history = []
-        self.adversarial_loss_history = []
 
-    def update(self, content_loss, style_loss, adversarial_loss):
-        self.content_loss_history.append(content_loss.item())
-        self.style_loss_history.append(style_loss.item())
-        self.adversarial_loss_history.append(adversarial_loss.item())
-
-    def get_means(self):
-        # Compute the mean of the last N losses to prevent too much fluctuation
-        N = 64  # adjust N based on batch size and preferences
-        content_mean = np.mean(self.content_loss_history[-N:]) if len(self.content_loss_history) >= N else np.mean(self.content_loss_history)
-        style_mean = np.mean(self.style_loss_history[-N:]) if len(self.style_loss_history) >= N else np.mean(self.style_loss_history)
-        adversarial_mean = np.mean(self.adversarial_loss_history[-N:]) if len(self.adversarial_loss_history) >= N else np.mean(self.adversarial_loss_history)
-        return content_mean, style_mean, adversarial_mean
 
 
 

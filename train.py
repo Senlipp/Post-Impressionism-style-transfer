@@ -7,27 +7,25 @@ import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from datasets import StyleTransferDataset
-from models import Generator, Discriminator, FeatureExtractor, LossTracker
+from models import Generator, Discriminator, FeatureExtractor
 
 
 def gram_matrix(features):
     b, ch, h, w = features.size()
     features = features.view(b, ch, h * w)
     gram = torch.bmm(features, features.transpose(1, 2))  # Batch matrix multiplication
-    gram = gram / (ch * h * w)
+    # gram = gram / (ch * h * w)
     return gram
 
 def compute_content_loss(gen_features, content_features):
     # Use the deepest layer for content loss
-    content_loss = F.mse_loss(gen_features[4], content_features[4])
+    content_loss = F.mse_loss(gen_features, content_features)
     return content_loss
 
 # Compute style loss
 def compute_style_loss(gen_features, style_features):
     style_loss = 0
-    # You can choose which layers to include in style loss
-    style_layers = [0, 1, 2, 3]  # Exclude the deepest layer (content layer)
-    for i in style_layers:
+    for i in range(len(gen_features)):
         gm_gf = gram_matrix(gen_features[i])
         gm_sf = gram_matrix(style_features[i])
         
@@ -35,25 +33,14 @@ def compute_style_loss(gen_features, style_features):
     return style_loss
 
 # Compute total loss
-def compute_total_loss(content_loss, style_loss, adversarial_loss, alpha, beta, gamma, loss_tracker):
-    # Get running averages of losses
-    content_mean, style_mean, adversarial_mean = loss_tracker.get_means()
-    epsilon = 1e-8
+def compute_total_loss(content_loss, style_loss, adversarial_loss, alpha, beta, gamma):
 
-    # Compute scaling factors inversely proportional to the loss magnitudes
-    content_scale = 1.0 / (content_mean + epsilon)
-    style_scale = 1.0 / (style_mean + epsilon)
-    adversarial_scale = 1.0 / (adversarial_mean + epsilon)
-
-    # Normalize the losses
-    normalized_content_loss = content_loss * content_scale
-    normalized_style_loss = style_loss * style_scale
-    normalized_adversarial_loss = adversarial_loss * adversarial_scale
 
     # Compute total loss with adjusted weights
-    total_loss = alpha * normalized_content_loss + beta * normalized_style_loss + gamma * normalized_adversarial_loss
+    total_loss = alpha * content_loss + beta * style_loss + gamma * adversarial_loss
     return total_loss
 
+# def normalize_tensor(
 
 # Prepare DataLoaders
 def prepare_dataloaders(base_dir, batch_size=8):
@@ -75,11 +62,9 @@ def prepare_dataloaders(base_dir, batch_size=8):
 
 # Training Loop
 def train(generator, discriminator, feature_extractor, dataloaders, epochs, alpha, beta, gamma, device):
-    g_optimizer = torch.optim.Adam(generator.parameters(), lr=1e-5, betas=(0.5, 0.999))
-    d_optimizer = torch.optim.Adam(discriminator.parameters(), lr=1e-5, betas=(0.5, 0.999))
+    g_optimizer = torch.optim.Adam(generator.parameters(), lr=1e-5, betas=(0.5, 0.999), weight_decay=1e-4)
+    d_optimizer = torch.optim.Adam(discriminator.parameters(), lr=1e-6, betas=(0.5, 0.999), weight_decay=1e-4)
     adversarial_loss_fn = nn.BCELoss()
-
-    loss_tracker = LossTracker()
 
     # Initialize lists to store losses per iteration
     g_iteration_losses = []
@@ -113,11 +98,14 @@ def train(generator, discriminator, feature_extractor, dataloaders, epochs, alph
             real_inputs = torch.cat((content_images, style_images), dim=1)
             fake_inputs = torch.cat((content_images, generated_images), dim=1)
 
+            real_inputs += torch.randn_like(real_inputs) * 0.05
+            fake_inputs += torch.randn_like(fake_inputs) * 0.05
+
             real_validity = discriminator(real_inputs)
             fake_validity = discriminator(fake_inputs)
 
-            real_labels = torch.ones_like(real_validity, device=device)
-            fake_labels = torch.zeros_like(fake_validity, device=device)
+            real_labels = torch.ones_like(real_validity, device=device) * 0.9
+            fake_labels = torch.zeros_like(fake_validity, device=device) + 0.1
 
             real_loss = adversarial_loss_fn(real_validity, real_labels)
             fake_loss = adversarial_loss_fn(fake_validity, fake_labels)
@@ -133,15 +121,17 @@ def train(generator, discriminator, feature_extractor, dataloaders, epochs, alph
             fake_validity = discriminator(fake_inputs)
             adv_loss = adversarial_loss_fn(fake_validity, real_labels)  # Generator tries to fool discriminator
 
-            gen_features = feature_extractor(generated_images)
-            content_features = feature_extractor(content_images)
-            style_features = feature_extractor(style_images)
-            content_loss = compute_content_loss(gen_features, content_features)
-            style_loss = compute_style_loss(gen_features, style_features)
 
-            loss_tracker.update(content_loss, style_loss, adv_loss)
+            style_features_gen, content_feature_gen = feature_extractor(generated_images)
+            style_features_style, content_feature_style = feature_extractor(style_images)
+            style_features_content, content_feature_content = feature_extractor(content_images)
 
-            g_loss = compute_total_loss(content_loss, style_loss, adv_loss, alpha, beta, gamma, loss_tracker)
+
+            content_loss = compute_content_loss(content_feature_gen, content_feature_content)
+            style_loss = compute_style_loss(style_features_gen, style_features_style)
+
+
+            g_loss = compute_total_loss(content_loss, style_loss, adv_loss, alpha, beta, gamma)
 
             g_optimizer.zero_grad()
             g_loss.backward()
@@ -176,18 +166,19 @@ def train(generator, discriminator, feature_extractor, dataloaders, epochs, alph
                 content_images, style_images = content_images.to(device), style_images.to(device)
                 generated_images = generator(content_images)
 
-                gen_features = feature_extractor(generated_images)
-                content_features = feature_extractor(content_images)
-                style_features = feature_extractor(style_images)
+                style_features_gen, content_feature_gen = feature_extractor(generated_images)
+                style_features_style, content_feature_style = feature_extractor(style_images)
+                style_features_content, content_feature_content = feature_extractor(content_images)
 
-                content_loss = compute_content_loss(gen_features, content_features)
-                style_loss = compute_style_loss(gen_features, style_features)
 
-                g_loss = compute_total_loss(content_loss, style_loss, 0, alpha, beta, 0, loss_tracker)  # No adversarial loss during validation
+                content_loss = compute_content_loss(content_feature_gen, content_feature_content)
+                style_loss = compute_style_loss(style_features_gen, style_features_style)
+
+                g_loss= compute_total_loss(content_loss, style_loss, 0, alpha, beta, 0)  # No adversarial loss during validation
 
                 val_g_loss += g_loss.item()
-                val_content_loss += content_loss.item()
-                val_style_loss += style_loss.item()
+                val_content_loss += content_loss.item() * alpha
+                val_style_loss += style_loss.item() * beta
 
         # Calculate average validation losses
         avg_val_g_loss = val_g_loss / len(dataloaders["val"])
@@ -202,10 +193,14 @@ def train(generator, discriminator, feature_extractor, dataloaders, epochs, alph
         print(f"Train - G Loss: {avg_g_loss:.4f}, D Loss: {avg_d_loss:.4f}")
         print(f"Val   - G Loss: {avg_val_g_loss:.4f}, Content Loss: {avg_val_content_loss:.4f}, Style Loss: {avg_val_style_loss:.4f}")
 
+        # os.makedirs("generated_training", exist_ok=True)
+
+
+
         # Save the model with the lowest validation loss
         if avg_val_g_loss < min_val_loss:
             min_val_loss = avg_val_g_loss
-            torch.save(generator.state_dict(), "best_generator.pth")
+            torch.save(generator.state_dict(), "best_generator_2.pth")
             torch.save(discriminator.state_dict(), "best_discriminator.pth")
             print("Best model saved based on validation loss.")
 
@@ -259,13 +254,14 @@ def train(generator, discriminator, feature_extractor, dataloaders, epochs, alph
     plt.show()
 
     # Save final models
-    torch.save(generator.state_dict(), "final_generator.pth")
-    torch.save(discriminator.state_dict(), "final_discriminator.pth")
+    torch.save(generator.state_dict(), "final_generator_2.pth")
+    torch.save(discriminator.state_dict(), "final_discriminator_2.pth")
     print("Final models saved.")
 
 
 def test(generator, dataloader, device):
     generator.eval()
+    image_count = 0
     with torch.no_grad():
         for idx, (content_images, _) in enumerate(dataloader):
             content_images = content_images.to(device)
@@ -280,8 +276,11 @@ def test(generator, dataloader, device):
                 content_img = transforms.ToPILImage()(content_images[i])
                 generated_img = transforms.ToPILImage()(generated_images[i])
 
-                content_img.save(f"test_results/content_{idx}_{i}.png")
-                generated_img.save(f"test_results/generated_{idx}_{i}.png")
+                content_img.save(f"test_results_2/content_{idx}_{i}.png")
+                generated_img.save(f"test_results_2/generated_{idx}_{i}.png")
+                image_count += 1
+
+    print(f"Total images saved: {image_count}")
 
 # Main Script
 if __name__ == "__main__":
@@ -295,15 +294,17 @@ if __name__ == "__main__":
     discriminator = Discriminator().to(device)
 
     feature_extractor = FeatureExtractor().to(device)
+    generator.load_state_dict(torch.load("best_generator_2.pth"))
     # Train the model
-    train(generator, discriminator, feature_extractor, dataloaders, epochs=30, alpha=1, beta=1, gamma=5, device=device)
+    train(generator, discriminator, feature_extractor, dataloaders, epochs=300, alpha=0.7, beta=1e-6, gamma=1, device=device)
 
     # Load the best model for testing
-    generator.load_state_dict(torch.load("best_generator.pth"))
+    generator.load_state_dict(torch.load("best_generator_2.pth"))
 
     # Create directory for test results
-    os.makedirs("test_results", exist_ok=True)
+    os.makedirs("test_results_2", exist_ok=True)
 
     # Test the model
     test(generator, dataloaders["test"], device=device)
+
 
